@@ -77,3 +77,16 @@ Event morphology graphs
 Timeline evolution
 
 Optional: Export results as PDF report
+
+🤝 Contributing
+
+Contributions are welcome!
+- Fork the repo
+- Create a new branch
+- Commit changes
+- Open a pull request
+
+👨‍⚕️ Disclaimer
+
+This tool is intended for research and educational use only.
+It is not approved for clinical diagnosis.

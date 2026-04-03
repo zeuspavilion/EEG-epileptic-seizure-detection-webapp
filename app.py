@@ -1,11 +1,10 @@
-# app.py (patched, minimal changes from your original version)
 import os
 import json
 import numpy as np
 import mne
 import tensorflow as tf
-from flask import Flask, request, jsonify, current_app
-from scipy.signal import butter, filtfilt, medfilt, resample
+from flask import Flask, request, jsonify
+from scipy.signal import butter, filtfilt, iirnotch, resample_poly
 import tempfile
 from threading import Lock
 
@@ -13,7 +12,8 @@ from threading import Lock
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # --- 1. Configuration ---
-SAMPLING_RATE = 256
+# "Harvard Standard": The model is trained on 256Hz. We must match this strictly.
+SAMPLING_RATE = 256  
 LOWCUT = 0.5
 HIGHCUT = 40.0
 WINDOW_SECONDS = 2
@@ -21,26 +21,22 @@ OVERLAP_PERCENT = 0.5
 STEP_SECONDS = WINDOW_SECONDS * (1 - OVERLAP_PERCENT)
 N_CHANNELS = 18
 
-# --- Safe constants (no magic numbers, units documented) ---
+# --- Safe constants ---
 VOLTS_TO_UV = 1e6
-CLIP_LIMIT_UV = 1000.0   # microvolts: clip signals to +/- CLIP_LIMIT_UV μV before further processing
+CLIP_LIMIT_UV = 1000.0  
 EPS = 1e-8
 
-# --- Model caching with a lock to avoid race loads in the same worker ---
+# --- Model caching ---
 _model = None
 _model_lock = Lock()
 
 def get_model():
-    """
-    Thread-safe lazy loading of the model inside the current process.
-    NOTE: Each worker/process will still get its own model instance unless you use
-    Gunicorn preload or an external model server (TF-Serving / Triton).
-    """
     global _model
     if _model is None:
         with _model_lock:
             if _model is None:
                 try:
+                    # Ensure this file exists in your directory
                     _model = tf.keras.models.load_model('BEST_MODEL_cnn_lstm.h5')
                     print("* Model loaded successfully!")
                 except Exception as e:
@@ -48,7 +44,7 @@ def get_model():
                     return None
     return _model
 
-# --- 2. Helper Functions ---
+# --- 2. Advanced Signal Processing (The "Harvard" Upgrade) ---
 
 def mad(x):
     x = np.asarray(x)
@@ -59,15 +55,38 @@ def smooth_probabilities(prob, ma_window=5, median_k=3):
     if len(prob) == 0: return prob
     kernel = np.ones(ma_window) / ma_window
     smoothed = np.convolve(prob, kernel, mode='same')
+    from scipy.signal import medfilt
     if median_k % 2 == 0: median_k += 1
     filtered = medfilt(smoothed, kernel_size=median_k)
     return filtered
 
-def bandpass_filter(data, fs=SAMPLING_RATE, order=5):
+def apply_advanced_filtering(data, fs):
+    """
+    Invigilator's Standard Filter Chain:
+    1. Notch Filter 50Hz (India/Europe Power)
+    2. Notch Filter 60Hz (US Power - just in case)
+    3. Bandpass 0.5Hz - 40Hz (The Guillotine for artifacts)
+    """
     nyq = 0.5 * fs
+    
+    # A. The Twin-Notch (Surgical Removal of Mains Hum)
+    # 50 Hz Notch
+    if fs > 100: # Can only notch if fs is high enough
+        b_notch, a_notch = iirnotch(50.0, 30.0, fs)
+        data = filtfilt(b_notch, a_notch, data, axis=-1)
+        
+        # 60 Hz Notch
+        b_notch60, a_notch60 = iirnotch(60.0, 30.0, fs)
+        data = filtfilt(b_notch60, a_notch60, data, axis=-1)
+
+    # B. The Bandpass (Butterworth Order 5)
     low = LOWCUT / nyq
     high = HIGHCUT / nyq
-    b, a = butter(order, [low, high], btype='band')
+    
+    # Safety check for Nyquist
+    if high >= 1.0: high = 0.99 
+
+    b, a = butter(5, [low, high], btype='band')
     return filtfilt(b, a, data, axis=-1)
 
 def segment_data_continuous(data, window_seconds, overlap_percent):
@@ -89,16 +108,12 @@ def segment_data_continuous(data, window_seconds, overlap_percent):
     return windows
 
 def normalize_windows(windows):
+    # Standard Score (Z-score) normalization
     X_mean = windows.mean(axis=-1, keepdims=True)
     X_std = windows.std(axis=-1, keepdims=True)
     return (windows - X_mean) / (X_std + EPS)
 
-# --- Safe temporary file save helper ---
 def save_uploaded_file_safe(file_storage_obj, suffix=".edf"):
-    """
-    Save uploaded file to a unique temp file and return path.
-    Caller MUST delete the returned file after use.
-    """
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     tmp_name = tmp.name
     try:
@@ -113,13 +128,7 @@ def save_uploaded_file_safe(file_storage_obj, suffix=".edf"):
             pass
         raise
 
-# --- Unit-aware clipping helper ---
 def safe_clip_and_unit_convert(eeg_data, data_unit='V'):
-    """
-    Convert incoming data to Volts if needed, clip in microvolts, and return in Volts.
-    - MNE returns Volts by default, so 'V' means convert V -> μV for clipping, then back to V.
-    - If incoming is already in 'uV', adapt accordingly (not expected with MNE).
-    """
     if data_unit == 'V':
         eeg_uv = eeg_data * VOLTS_TO_UV
     elif data_unit == 'uV':
@@ -127,26 +136,22 @@ def safe_clip_and_unit_convert(eeg_data, data_unit='V'):
     else:
         raise ValueError("Unknown data_unit")
 
+    # Hard clip to prevent numeric explosion from loose wires
     eeg_uv = np.clip(eeg_uv, -CLIP_LIMIT_UV, CLIP_LIMIT_UV)
-    return eeg_uv / VOLTS_TO_UV  # back to Volts
+    return eeg_uv / VOLTS_TO_UV
 
-# --- Mophology extraction picking the highest-energy channel (no averaging) ---
 def extract_event_morphology(filtered_eeg, start_sample, end_sample, fs, channel_labels=None, target_points=600):
-    """
-    Returns a dict like {'x': [...], 'y': [...], 'channel_index': idx, 'channel_label': label, 'peak_amplitude': float}
-    - filtered_eeg: (channels, samples)
-    - start_sample, end_sample: indices (int)
-    """
-    segment = filtered_eeg[:, start_sample:end_sample]  # (channels, time)
+    segment = filtered_eeg[:, start_sample:end_sample]
     if segment.shape[1] < 10:
         return None
 
-    # Channel energy: variance (or mean-square) — identifies focal channels
+    # Pick the channel with the highest variance (most "active")
     channel_energy = np.var(segment, axis=1)
     max_ch_idx = int(np.argmax(channel_energy))
     best_signal = segment[max_ch_idx, :]
 
-    # Downsample/resample for UI
+    # Resample for UI visualization
+    from scipy.signal import resample
     if len(best_signal) > target_points:
         ui_signal = resample(best_signal, target_points)
         time_axis = np.linspace(0, len(best_signal)/fs, target_points)
@@ -166,23 +171,21 @@ def extract_event_morphology(filtered_eeg, start_sample, end_sample, fs, channel
         "y": ui_signal_norm,
         "channel_index": max_ch_idx,
         "channel_label": ch_label,
-        "peak_amplitude_volts": float(peak)  # peak in Volts (document that UI may convert to uV if desired)
+        "peak_amplitude_volts": float(peak)
     }
 
-# --- process_raw_edf: minimal changes but safer clipping and better channel selection ---
+# --- 3. The Core Processing Logic ---
+
 def process_raw_edf(edf_path):
     """
-    Reads EDF and returns:
-      - model_input: normalized windows shaped (n_windows, channels, window_samples, 1)
-      - filtered_eeg: continuous filtered signal (channels, samples)
-      - info: dict with 'fs', 'window_samples', 'step_samples', 'ch_names', 'num_samples'
-    Returns (model_input, filtered_eeg, info) or (None, None, None) on failure.
+    Reads EDF, applies Harvard-Standard Filtering, and formats for Model.
     """
     try:
+        # Load without preloading first to check channels
         raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
         fs = int(raw.info['sfreq'])
 
-        # Strict channel selection: prefer MNE EEG channels
+        # --- Channel Selection ---
         eeg_picks = []
         for ch in raw.info['ch_names']:
             try:
@@ -192,45 +195,54 @@ def process_raw_edf(edf_path):
             if ch_type == 'eeg':
                 eeg_picks.append(ch)
 
-        # fallback by name if metadata poor
         if len(eeg_picks) < N_CHANNELS:
-            eeg_picks = [ch for ch in raw.info['ch_names'] if 'EEG' in ch.upper()]
+            eeg_picks = [ch for ch in raw.info['ch_names'] if 'EEG' in ch.upper() or 'CH' in ch.upper()]
 
-        if len(eeg_picks) < N_CHANNELS:
-            raise ValueError(f"Not enough EEG channels found. Needed {N_CHANNELS}, found {len(eeg_picks)}")
-
-        # pick first N_CHANNELS
+        # Fallback: Just take first N channels if we can't find named EEG channels
+        if len(eeg_picks) < 1:
+            eeg_picks = raw.info['ch_names'][:N_CHANNELS]
+            
         picks = eeg_picks[:N_CHANNELS]
+        
+        if len(picks) == 0:
+            raise ValueError("No valid channels found in EDF.")
+            
         raw.pick_channels(picks)
-        ch_names = raw.info['ch_names']
-        eeg_data = raw.get_data()  # shape (n_channels, n_samples)
+        eeg_data = raw.get_data() # (n_channels, n_samples)
 
-        # Clip in microvolts with explicit conversion (MNE typically returns Volts)
+        # 1. Clip artifacts (Safety Net)
         eeg_data = safe_clip_and_unit_convert(eeg_data, data_unit='V')
 
-        # Filter
-        filtered_eeg = bandpass_filter(eeg_data, fs=fs)
-
-        # Resample continuous filtered_eeg to SAMPLING_RATE if necessary
+        # 2. Resampling (Anti-Aliasing Safe)
+        # If the file is NOT 256Hz, we must resample it.
         if fs != SAMPLING_RATE:
-            num_samples = int(filtered_eeg.shape[1] * SAMPLING_RATE / fs)
-            filtered_eeg = resample(filtered_eeg, num_samples, axis=1)
+            # Calculate number of samples
+            num_samples = int(eeg_data.shape[1] * SAMPLING_RATE / fs)
+            # resample_poly is better than standard resample (implements anti-aliasing filter)
+            eeg_data = resample_poly(eeg_data, SAMPLING_RATE, fs, axis=1)
             fs = SAMPLING_RATE
 
+        # 3. Apply Advanced Filtering (Notch + Bandpass)
+        filtered_eeg = apply_advanced_filtering(eeg_data, fs)
+
+        # 4. Windowing for Model
         window_samples = int(WINDOW_SECONDS * fs)
         step_samples = int(window_samples * (1 - OVERLAP_PERCENT))
         windows = segment_data_continuous(filtered_eeg, WINDOW_SECONDS, OVERLAP_PERCENT)
+        
         if len(windows) == 0:
             return None, None, None
 
         norm_windows = normalize_windows(windows)
+        
+        # Reshape for CNN-LSTM: (Batch, Channels, Time, 1)
         model_input = norm_windows.reshape(norm_windows.shape[0], norm_windows.shape[1], norm_windows.shape[2], 1)
 
         info = {
             'fs': fs,
             'window_samples': window_samples,
             'step_samples': step_samples,
-            'ch_names': ch_names,
+            'ch_names': picks,
             'num_samples': filtered_eeg.shape[1]
         }
         return model_input, filtered_eeg, info
@@ -239,7 +251,7 @@ def process_raw_edf(edf_path):
         print(f"Error in process_raw_edf: {e}")
         return None, None, None
 
-# --- detection logic unchanged, just keep it here ---
+# --- 4. Detection Logic (Unchanged) ---
 def detect_seizure_with_postprocessing(probability_scores, patient_profile,
                                        ma_window=5, median_k=3,
                                        n_consecutive=3, min_duration_s=6,
@@ -322,7 +334,7 @@ def detect_seizure_with_postprocessing(probability_scores, patient_profile,
 
     return decision
 
-# --- 4. Flask App ---
+# --- 5. Flask Endpoints ---
 
 app = Flask(__name__)
 
@@ -339,11 +351,9 @@ def calibrate_multi():
 
     all_predictions = []
     for file in files:
-        # Use safe temp file saving
         try:
             temp_path = save_uploaded_file_safe(file)
         except Exception as e:
-            print(f"Failed saving uploaded file {getattr(file,'filename',None)}: {e}")
             continue
 
         try:
@@ -352,12 +362,11 @@ def calibrate_multi():
                 preds = model.predict(model_input, verbose=0).flatten()
                 all_predictions.extend(preds.tolist())
         except Exception as e:
-            print(f"Calibration error on file {getattr(file,'filename',None)}: {e}")
+            print(f"Calibration error: {e}")
         finally:
             try:
                 if os.path.exists(temp_path): os.remove(temp_path)
-            except Exception:
-                pass
+            except Exception: pass
 
     if len(all_predictions) == 0:
         return jsonify({'error': 'No valid EEG data extracted'}), 500
@@ -370,7 +379,6 @@ def calibrate_multi():
 
     k = float(request.form.get('mad_k', 6.0))
     new_threshold = min(median_baseline + k * mad_baseline, 0.95)
-
     if mad_baseline < 1e-4:
         new_threshold = min(np.percentile(arr, 99) + 0.05, 0.95)
 
@@ -414,7 +422,6 @@ def predict_adaptive():
                 patient_profile = db.get(patient_id, patient_profile)
         except: pass
 
-    # Use safe tempfile saving instead of user-based filename
     try:
         temp_path = save_uploaded_file_safe(file)
     except Exception as e:
@@ -439,19 +446,15 @@ def predict_adaptive():
         peak_req = float(request.form.get('peak_req', 0.80))
 
         detection_result = detect_seizure_with_postprocessing(
-            probability_scores,
-            patient_profile,
-            ma_window=ma_window,
-            median_k=median_k,
-            n_consecutive=n_consecutive,
-            min_duration_s=min_duration_s,
+            probability_scores, patient_profile,
+            ma_window=ma_window, median_k=median_k,
+            n_consecutive=n_consecutive, min_duration_s=min_duration_s,
             peak_req=peak_req
         )
 
         e = detection_result['evidence']
         events = e.get('events', [])
 
-        # default reported values
         if len(events) > 0:
             reported_peak_prob = events[0]['peak_prob']
             reported_duration = events[0]['duration_s']
@@ -463,23 +466,22 @@ def predict_adaptive():
             start_w = None
             end_w = None
 
+        # --- UPDATED MORPHOLOGY EXTRACTION (Force QC Logic) ---
         morphology_json = None
-        # Extract real waveform from filtered_eeg if we have an event
+        
+        # 1. Seizure Case: Use the detected start/end
         if start_w is not None and end_w is not None and filtered_eeg is not None and info is not None:
             fs = info['fs']
             window_samples = info['window_samples']
             step_samples = info['step_samples']
-            n_channels = filtered_eeg.shape[0]
             num_samples = filtered_eeg.shape[1]
 
             start_sample = max(0, start_w * step_samples)
             end_sample = min(num_samples, end_w * step_samples + window_samples)
 
             if end_sample - start_sample > 10:
-                # Use per-channel energy selection (do NOT average)
                 morphology = extract_event_morphology(filtered_eeg, start_sample, end_sample, fs, channel_labels=info.get('ch_names'))
                 if morphology is not None:
-                    # include additional metadata for UI
                     morphology_json = {
                         'x': morphology['x'],
                         'y': morphology['y'],
@@ -487,9 +489,35 @@ def predict_adaptive():
                         'fs': fs,
                         'original_amplitude_volts': morphology.get('peak_amplitude_volts')
                     }
+        
+        # 2. NO SEIZURE Case: Force a QC Sample (Middle 3 seconds)
+        # This ensures the frontend gets a waveform to display even if normal.
+        if morphology_json is None and filtered_eeg is not None and info is not None:
+            fs = info['fs']
+            num_samples = filtered_eeg.shape[1]
+            
+            # Define a 3-second window
+            qc_duration = 3 * fs
+            mid_point = num_samples // 2
+            
+            start_qc = max(0, mid_point - qc_duration // 2)
+            end_qc = min(num_samples, start_qc + qc_duration)
+            
+            morphology = extract_event_morphology(filtered_eeg, start_qc, end_qc, fs, channel_labels=info.get('ch_names'))
+            
+            if morphology is not None:
+                morphology_json = {
+                    'x': morphology['x'],
+                    'y': morphology['y'],
+                    'channel': morphology.get('channel_label') or "QC_Check",
+                    'fs': fs,
+                    'original_amplitude_volts': morphology.get('peak_amplitude_volts'),
+                    'note': 'QC_SAMPLE_NO_SEIZURE'
+                }
+        # --------------------------------------------------------
 
         normalized = {
-            'overall_prediction': "⚠️ SEIZURE DETECTED" if detection_result.get('seizure_detected') else "✓ No Seizure Detected",
+            'overall_prediction': " SEIZURE DETECTED" if detection_result.get('seizure_detected') else "✓ No Seizure Detected",
             'confidence': detection_result.get('confidence', 0.0),
             'clinical_action': detection_result.get('clinical_action', 'N/A'),
             'windows_analyzed': len(probability_scores),
@@ -508,8 +536,7 @@ def predict_adaptive():
     finally:
         try:
             if os.path.exists(temp_path): os.remove(temp_path)
-        except Exception:
-            pass
+        except Exception: pass
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
